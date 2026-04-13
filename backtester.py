@@ -126,6 +126,8 @@ def run_backtest(prices_file: str, trades_file: str, label: str = ""):
                 if t_ts in trade_data:
                     for sym, tlist in trade_data[t_ts].items():
                         for t in tlist:
+                            if sym not in market_trades:
+                                continue
                             market_trades[sym].append(
                                 Trade(
                                     symbol=sym,
@@ -306,7 +308,8 @@ def run_backtest(prices_file: str, trades_file: str, label: str = ""):
                             break
 
                 # Check if any of our passive sell orders would get filled
-                bot_qty = bt['quantity']  # reset for sell side
+                # Use remaining bot_qty after buy-side fills (no reset)
+                # to avoid double-counting the same trade on both sides
                 for order in passive_sell_orders:
                     if order.quantity >= 0:
                         continue
