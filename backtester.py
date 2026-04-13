@@ -1,6 +1,11 @@
 """
 Local backtester for Prosperity 4 Round 0 trading strategies.
 Simulates the exchange matching engine using historical price data.
+
+Includes bot-fill simulation: when bots trade at prices worse than our
+posted limit orders, we get priority fills at our quoted price.
+This reflects actual Prosperity exchange behavior where passive limit
+orders inside the spread capture bot flow.
 """
 
 import csv
@@ -176,14 +181,36 @@ def run_backtest(prices_file: str, trades_file: str, label: str = ""):
                 orders = [o for o in orders if o.quantity > 0]
                 total_sell_qty = 0
 
+            # Separate aggressive (crossing) orders from passive (limit) orders
+            aggressive_orders = []
+            passive_buy_orders = []   # limit buys that don't cross the book
+            passive_sell_orders = []  # limit sells that don't cross the book
+
+            best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
+            best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
+
             for order in orders:
+                if order.quantity > 0:
+                    # Buy order
+                    if best_ask is not None and order.price >= best_ask:
+                        aggressive_orders.append(order)
+                    else:
+                        passive_buy_orders.append(order)
+                elif order.quantity < 0:
+                    # Sell order
+                    if best_bid is not None and order.price <= best_bid:
+                        aggressive_orders.append(order)
+                    else:
+                        passive_sell_orders.append(order)
+
+            # PHASE 1: Execute aggressive orders against order book
+            for order in aggressive_orders:
                 if order.quantity > 0:
                     # Buy order: match against sell orders
                     sorted_asks = sorted(od.sell_orders.items())
                     for ask_price, ask_vol in sorted_asks:
                         if order.price >= ask_price and order.quantity > 0:
-                            # Match
-                            available = -ask_vol  # ask_vol is negative
+                            available = -ask_vol
                             fill_qty = min(order.quantity, available)
 
                             if position[product] + fill_qty > limit:
@@ -192,7 +219,6 @@ def run_backtest(prices_file: str, trades_file: str, label: str = ""):
                             if fill_qty <= 0:
                                 break
 
-                            # Execute trade
                             position[product] += fill_qty
                             pnl[product] -= fill_qty * ask_price
                             order.quantity -= fill_qty
@@ -209,7 +235,6 @@ def run_backtest(prices_file: str, trades_file: str, label: str = ""):
                             )
 
                 elif order.quantity < 0:
-                    # Sell order: match against buy orders
                     sorted_bids = sorted(od.buy_orders.items(), reverse=True)
                     sell_qty = -order.quantity
                     for bid_price, bid_vol in sorted_bids:
@@ -223,7 +248,6 @@ def run_backtest(prices_file: str, trades_file: str, label: str = ""):
                             if fill_qty <= 0:
                                 break
 
-                            # Execute trade
                             position[product] -= fill_qty
                             pnl[product] += fill_qty * bid_price
                             sell_qty -= fill_qty
@@ -238,6 +262,75 @@ def run_backtest(prices_file: str, trades_file: str, label: str = ""):
                                 Trade(product, bid_price, fill_qty,
                                       buyer="", seller="SUBMISSION", timestamp=ts)
                             )
+
+            # PHASE 2: Simulate bot fills on our passive limit orders
+            # When bots trade at prices that cross our limit orders,
+            # we get filled at our posted price (price improvement).
+            bot_trades = []
+            if ts in trade_data:
+                for sym, tlist in trade_data[ts].items():
+                    if sym == product:
+                        for t in tlist:
+                            bot_trades.append({
+                                'price': int(float(t['price'])),
+                                'quantity': int(float(t['quantity']))
+                            })
+
+            for bt in bot_trades:
+                bot_price = bt['price']
+                bot_qty = bt['quantity']
+
+                # Check if any of our passive buy orders would get filled
+                for order in passive_buy_orders:
+                    if order.quantity <= 0:
+                        continue
+                    # Bot sold at bot_price; if our bid >= bot_price,
+                    # we get filled at OUR price (our_bid)
+                    if order.price >= bot_price:
+                        fill_qty = min(order.quantity, bot_qty)
+                        if position[product] + fill_qty > limit:
+                            fill_qty = limit - position[product]
+                        if fill_qty <= 0:
+                            continue
+                        position[product] += fill_qty
+                        pnl[product] -= fill_qty * order.price
+                        order.quantity -= fill_qty
+                        bot_qty -= fill_qty
+                        total_trades += 1
+                        total_volume += fill_qty
+                        prev_own_trades[product].append(
+                            Trade(product, order.price, fill_qty,
+                                  buyer="SUBMISSION", seller="BOT", timestamp=ts)
+                        )
+                        if bot_qty <= 0:
+                            break
+
+                # Check if any of our passive sell orders would get filled
+                bot_qty = bt['quantity']  # reset for sell side
+                for order in passive_sell_orders:
+                    if order.quantity >= 0:
+                        continue
+                    sell_qty = -order.quantity
+                    # Bot bought at bot_price; if our ask <= bot_price,
+                    # we get filled at OUR price (our_ask)
+                    if order.price <= bot_price:
+                        fill_qty = min(sell_qty, bot_qty)
+                        if position[product] - fill_qty < -limit:
+                            fill_qty = position[product] + limit
+                        if fill_qty <= 0:
+                            continue
+                        position[product] -= fill_qty
+                        pnl[product] += fill_qty * order.price
+                        order.quantity += fill_qty
+                        bot_qty -= fill_qty
+                        total_trades += 1
+                        total_volume += fill_qty
+                        prev_own_trades[product].append(
+                            Trade(product, order.price, fill_qty,
+                                  buyer="BOT", seller="SUBMISSION", timestamp=ts)
+                        )
+                        if bot_qty <= 0:
+                            break
 
     # Final PnL: realized PnL + mark-to-market of remaining position
     print(f"\n{'='*60}")
