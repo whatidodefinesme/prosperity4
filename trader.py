@@ -8,30 +8,22 @@ class Trader:
     Optimized PnL trading strategy for Prosperity 4 - Round 0.
 
     Products:
-    - EMERALDS: Stable fair value at 10000. Wide market-making to capture bot fills.
-    - TOMATOES: Mean-reverting (autocorr=-0.41). EMA(58) fair value + wide quoting.
+    - EMERALDS: Stable fair value at 10000. Penny-jumping market-making.
+    - TOMATOES: Mean-reverting. EMA(58) fair value + tight market-making.
 
-    Strategy produces ~11,000+ avg PnL/day in backtesting with bot-fill simulation.
+    Key insight: most PnL comes from passive fills (bots trading against
+    our limit orders). Tighter quotes = higher fill probability = more PnL.
     """
 
-    # Position limits per product
     POSITION_LIMITS = {
         "EMERALDS": 50,
         "TOMATOES": 50,
     }
 
-    # EMERALDS: rock-solid fair value at 10000
     EMERALDS_FAIR_VALUE = 10000
-    # Limit order offsets: buy at fair-4, sell at fair+4 (captures 8 per round-trip)
-    EMERALDS_BUY_OFFSET = 4
-    EMERALDS_SELL_OFFSET = 4
 
-    # TOMATOES: EMA-based fair value
     TOMATOES_EMA_SPAN = 58
     TOMATOES_EMA_ALPHA = 2.0 / (58 + 1)
-    # Wider offsets on TOMATOES to capture more per bot fill
-    TOMATOES_BUY_OFFSET = 5
-    TOMATOES_SELL_OFFSET = 4
 
     def bid(self):
         return 15
@@ -64,13 +56,13 @@ class Trader:
 
     def trade_emeralds(self, state: TradingState, product: str) -> List[Order]:
         """
-        EMERALDS: Market-making around fixed fair value of 10000.
+        EMERALDS: Penny-jumping market-making around fair value 10000.
 
-        Bot spread is 9992/10008 (width=16). We quote inside at fair +/- 4,
-        giving us buy@9996/sell@10004. When bots trade at 9992 or 10008,
-        our tighter quotes get priority, yielding 8 XIRECS per round-trip.
-
-        Position-aware: skew quotes to flatten inventory when position builds up.
+        Strategy:
+        1. Aggressively take any mispriced orders at or through fair value
+        2. Post penny-jump quotes (best_bid+1 / best_ask-1) to be the
+           tightest quote in the book, maximizing bot fill probability
+        3. Skew quotes based on position to flatten inventory
         """
         orders: List[Order] = []
         order_depth = state.order_depths[product]
@@ -81,39 +73,82 @@ class Trader:
         buy_capacity = limit - position
         sell_capacity = limit + position
 
-        # --- STEP 1: Sweep all mispriced orders across ALL book levels ---
+        # --- STEP 1: Sweep all mispriced orders ---
         remaining_buy = buy_capacity
         if remaining_buy > 0:
             for ask_price, ask_vol in sorted(order_depth.sell_orders.items()):
-                if ask_price <= fair and remaining_buy > 0:
+                if ask_price < fair and remaining_buy > 0:
                     take_qty = min(-ask_vol, remaining_buy)
                     orders.append(Order(product, ask_price, take_qty))
                     remaining_buy -= take_qty
+                elif ask_price == fair and remaining_buy > 0:
+                    # At fair: buy if short or flat to flatten position
+                    if position <= 0:
+                        take_qty = min(-ask_vol, remaining_buy)
+                        orders.append(Order(product, ask_price, take_qty))
+                        remaining_buy -= take_qty
 
         remaining_sell = sell_capacity
         if remaining_sell > 0:
             for bid_price, bid_vol in sorted(
                 order_depth.buy_orders.items(), reverse=True
             ):
-                if bid_price >= fair and remaining_sell > 0:
+                if bid_price > fair and remaining_sell > 0:
                     take_qty = min(bid_vol, remaining_sell)
                     orders.append(Order(product, bid_price, -take_qty))
                     remaining_sell -= take_qty
+                elif bid_price == fair and remaining_sell > 0:
+                    if position >= 0:
+                        take_qty = min(bid_vol, remaining_sell)
+                        orders.append(Order(product, bid_price, -take_qty))
+                        remaining_sell -= take_qty
 
-        # --- STEP 2: Post limit orders with position-skewed offsets ---
-        position_ratio = position / limit if limit > 0 else 0.0
+        # --- STEP 2: Penny-jump market-making with position skew ---
+        best_bid = (
+            max(order_depth.buy_orders.keys())
+            if order_depth.buy_orders
+            else fair - 8
+        )
+        best_ask = (
+            min(order_depth.sell_orders.keys())
+            if order_depth.sell_orders
+            else fair + 8
+        )
 
-        # Skew widens the offset on the overweight side, tightens the other
-        buy_off = self.EMERALDS_BUY_OFFSET + max(0, int(position_ratio * 4))
-        sell_off = self.EMERALDS_SELL_OFFSET + max(0, int(-position_ratio * 4))
-        buy_off = max(1, buy_off)
-        sell_off = max(1, sell_off)
+        # Position-based offset: tighter when flat, wider when skewed
+        # position_ratio: -1 (max short) to +1 (max long)
+        pos_ratio = position / limit if limit > 0 else 0.0
+
+        # Base: penny-jump (1 tick inside best bid/ask)
+        # Skew: when long, buy less aggressively and sell more aggressively
+        buy_price = best_bid + 1
+        sell_price = best_ask - 1
+
+        # Position skewing: shift prices to flatten inventory
+        if pos_ratio > 0.4:
+            # Heavily long: widen buy, tighten sell toward fair
+            buy_price = min(buy_price, fair - 2)
+            sell_price = min(sell_price, fair + 1)
+        elif pos_ratio > 0.2:
+            buy_price = min(buy_price, fair - 1)
+            sell_price = min(sell_price, fair + 1)
+        elif pos_ratio < -0.4:
+            # Heavily short: tighten buy toward fair, widen sell
+            buy_price = max(buy_price, fair - 1)
+            sell_price = max(sell_price, fair + 2)
+        elif pos_ratio < -0.2:
+            sell_price = max(sell_price, fair + 1)
+            buy_price = max(buy_price, fair - 1)
+
+        # Clamp: never buy above fair or sell below fair
+        buy_price = min(buy_price, fair - 1)
+        sell_price = max(sell_price, fair + 1)
 
         if remaining_buy > 0:
-            orders.append(Order(product, fair - buy_off, remaining_buy))
+            orders.append(Order(product, buy_price, remaining_buy))
 
         if remaining_sell > 0:
-            orders.append(Order(product, fair + sell_off, -remaining_sell))
+            orders.append(Order(product, sell_price, -remaining_sell))
 
         return orders
 
@@ -121,13 +156,11 @@ class Trader:
         self, state: TradingState, product: str, trader_state: dict
     ) -> tuple:
         """
-        TOMATOES: EMA(58)-based mean-reversion with wide market-making.
+        TOMATOES: EMA(58)-based mean-reversion with tight market-making.
 
-        Strong negative autocorrelation (-0.41) means prices revert to the EMA.
-        We aggressively take any orders mispriced vs. EMA, then post wide limit
-        orders (buy at EMA-5, sell at EMA+4) to capture bot fills at a profit.
-
-        Position management: skew offsets to lean toward flattening inventory.
+        Strong negative autocorrelation (-0.41) means prices revert to EMA.
+        We aggressively take mispriced orders and post tight penny-jump
+        quotes around the EMA fair value to maximize passive fill rate.
         """
         orders: List[Order] = []
         order_depth = state.order_depths[product]
@@ -167,7 +200,7 @@ class Trader:
         buy_capacity = limit - position
         sell_capacity = limit + position
 
-        # --- STEP 1: Sweep all mispriced orders ---
+        # --- STEP 1: Aggressively sweep mispriced orders ---
         remaining_buy = buy_capacity
         if remaining_buy > 0:
             for ask_price, ask_vol in sorted(order_depth.sell_orders.items()):
@@ -198,22 +231,37 @@ class Trader:
                     orders.append(Order(product, bid_price, -take_qty))
                     remaining_sell -= take_qty
 
-        # --- STEP 2: Post wide limit orders for bot fills ---
-        position_ratio = position / limit if limit > 0 else 0.0
+        # --- STEP 2: Tight market-making with position skew ---
+        pos_ratio = position / limit if limit > 0 else 0.0
 
-        buy_off = self.TOMATOES_BUY_OFFSET + max(0, int(position_ratio * 3))
-        sell_off = self.TOMATOES_SELL_OFFSET + max(0, int(-position_ratio * 3))
-        buy_off = max(1, buy_off)
-        sell_off = max(1, sell_off)
+        # Penny-jump: post 1 tick inside current best bid/ask
+        buy_price = best_bid + 1
+        sell_price = best_ask - 1
+
+        # Position-aware skewing
+        if pos_ratio > 0.4:
+            # Heavily long: widen buy, tighten sell
+            buy_price = min(buy_price, fair_int - 2)
+            sell_price = min(sell_price, fair_int + 1)
+        elif pos_ratio > 0.2:
+            buy_price = min(buy_price, fair_int - 1)
+            sell_price = min(sell_price, fair_int + 1)
+        elif pos_ratio < -0.4:
+            # Heavily short: tighten buy, widen sell
+            buy_price = max(buy_price, fair_int - 1)
+            sell_price = max(sell_price, fair_int + 2)
+        elif pos_ratio < -0.2:
+            buy_price = max(buy_price, fair_int - 1)
+            sell_price = max(sell_price, fair_int + 1)
+
+        # Clamp: never buy above fair or sell below fair
+        buy_price = min(buy_price, fair_int - 1)
+        sell_price = max(sell_price, fair_int + 1)
 
         if remaining_buy > 0:
-            orders.append(
-                Order(product, fair_int - buy_off, remaining_buy)
-            )
+            orders.append(Order(product, buy_price, remaining_buy))
 
         if remaining_sell > 0:
-            orders.append(
-                Order(product, fair_int + sell_off, -remaining_sell)
-            )
+            orders.append(Order(product, sell_price, -remaining_sell))
 
         return orders, trader_state
