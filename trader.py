@@ -1,6 +1,7 @@
 from datamodel import OrderDepth, TradingState, Order
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import json
+import math
 
 
 class Trader:
@@ -8,260 +9,241 @@ class Trader:
     Optimized PnL trading strategy for Prosperity 4 - Round 0.
 
     Products:
-    - EMERALDS: Stable fair value at 10000. Penny-jumping market-making.
-    - TOMATOES: Mean-reverting. EMA(58) fair value + tight market-making.
+    - EMERALDS: Stable fair value at 10000. Tight market-making with
+      penny-jump anchoring and position-proportional skewing.
+    - TOMATOES: Linear regression predictor + tight market-making.
 
-    Key insight: most PnL comes from passive fills (bots trading against
-    our limit orders). Tighter quotes = higher fill probability = more PnL.
+    Key insight: virtually all PnL comes from passive fills (bots trading
+    against our limit orders). Strategy maximizes fill probability via:
+    1. Tight spreads (close to fair value)
+    2. Penny-jump anchoring (always tightest quote in book)
+    3. Aggressive position skewing (flatten inventory fast)
+    4. Reconciled book state (anchor to post-take liquidity)
     """
 
     POSITION_LIMITS = {
-        "EMERALDS": 50,
-        "TOMATOES": 50,
+        "EMERALDS": 80,
+        "TOMATOES": 80,
     }
 
-    EMERALDS_FAIR_VALUE = 10000
-
-    TOMATOES_EMA_SPAN = 58
-    TOMATOES_EMA_ALPHA = 2.0 / (58 + 1)
+    REGRESSION_WINDOW = 15
 
     def bid(self):
         return 15
 
-    def run(self, state: TradingState):
-        result: Dict[str, List[Order]] = {}
+    def compute_regression_forecast(self, history: List[float]) -> float:
+        """Linear regression on price history to predict next value."""
+        n = len(history)
+        if n < 2:
+            return history[-1]
 
-        # Deserialize trader data (persisted state across iterations)
-        trader_state = {}
-        if state.traderData and state.traderData != "":
-            try:
-                trader_state = json.loads(state.traderData)
-            except (json.JSONDecodeError, TypeError):
-                trader_state = {}
+        sum_x = (n * (n - 1)) / 2
+        sum_x_sq = (n * (n - 1) * (2 * n - 1)) / 6
 
-        for product in state.order_depths:
-            if product == "EMERALDS":
-                orders = self.trade_emeralds(state, product)
-            elif product == "TOMATOES":
-                orders, trader_state = self.trade_tomatoes(
-                    state, product, trader_state
-                )
-            else:
-                orders = []
-            result[product] = orders
+        sum_y = sum(history)
+        sum_xy = sum(i * y for i, y in enumerate(history))
 
-        trader_data = json.dumps(trader_state)
-        conversions = 0
-        return result, conversions, trader_data
+        mean_x = sum_x / n
+        mean_y = sum_y / n
 
-    def trade_emeralds(self, state: TradingState, product: str) -> List[Order]:
+        denominator = sum_x_sq - n * (mean_x ** 2)
+        if denominator == 0:
+            return history[-1]
+
+        slope = (sum_xy - n * mean_x * mean_y) / denominator
+        intercept = mean_y - slope * mean_x
+
+        return slope * n + intercept
+
+    def take_opportunities(
+        self,
+        product: str,
+        fair_price: float,
+        position: int,
+        sorted_buys: List[Tuple[int, int]],
+        sorted_sells: List[Tuple[int, int]],
+        limit: int,
+        take_edge: float,
+    ) -> Tuple[List[Order], int, int, int]:
         """
-        EMERALDS: Penny-jumping market-making around fair value 10000.
+        Phase 1: Aggressively take mispriced orders from the book.
 
-        Strategy:
-        1. Aggressively take any mispriced orders at or through fair value
-        2. Post penny-jump quotes (best_bid+1 / best_ask-1) to be the
-           tightest quote in the book, maximizing bot fill probability
-        3. Skew quotes based on position to flatten inventory
+        Returns orders, updated position, and the remaining best bid/ask
+        after our takes (for anchoring market-making quotes).
         """
         orders: List[Order] = []
-        order_depth = state.order_depths[product]
-        position = state.position.get(product, 0)
-        limit = self.POSITION_LIMITS[product]
-        fair = self.EMERALDS_FAIR_VALUE
 
-        buy_capacity = limit - position
-        sell_capacity = limit + position
+        best_remaining_ask = sorted_sells[0][0] if sorted_sells else None
+        best_remaining_bid = sorted_buys[0][0] if sorted_buys else None
 
-        # --- STEP 1: Sweep all mispriced orders ---
-        remaining_buy = buy_capacity
-        if remaining_buy > 0:
-            for ask_price, ask_vol in sorted(order_depth.sell_orders.items()):
-                if ask_price < fair and remaining_buy > 0:
-                    take_qty = min(-ask_vol, remaining_buy)
-                    orders.append(Order(product, ask_price, take_qty))
-                    remaining_buy -= take_qty
-                elif ask_price == fair and remaining_buy > 0:
-                    # At fair: buy if short or flat to flatten position
-                    if position <= 0:
-                        take_qty = min(-ask_vol, remaining_buy)
-                        orders.append(Order(product, ask_price, take_qty))
-                        remaining_buy -= take_qty
+        # Hit asks below fair - edge
+        for ask_price, ask_vol in sorted_sells:
+            if ask_price <= fair_price - take_edge:
+                available = abs(ask_vol)
+                buy_size = min(available, limit - position)
+                if buy_size > 0:
+                    orders.append(
+                        Order(product, int(ask_price), int(buy_size))
+                    )
+                    position += buy_size
+                if buy_size < available:
+                    best_remaining_ask = ask_price
+                    break
+            else:
+                best_remaining_ask = ask_price
+                break
+        else:
+            best_remaining_ask = None
 
-        remaining_sell = sell_capacity
-        if remaining_sell > 0:
-            for bid_price, bid_vol in sorted(
-                order_depth.buy_orders.items(), reverse=True
-            ):
-                if bid_price > fair and remaining_sell > 0:
-                    take_qty = min(bid_vol, remaining_sell)
-                    orders.append(Order(product, bid_price, -take_qty))
-                    remaining_sell -= take_qty
-                elif bid_price == fair and remaining_sell > 0:
-                    if position >= 0:
-                        take_qty = min(bid_vol, remaining_sell)
-                        orders.append(Order(product, bid_price, -take_qty))
-                        remaining_sell -= take_qty
+        # Hit bids above fair + edge
+        for bid_price, bid_vol in sorted_buys:
+            if bid_price >= fair_price + take_edge:
+                sell_size = min(bid_vol, limit + position)
+                if sell_size > 0:
+                    orders.append(
+                        Order(product, int(bid_price), -int(sell_size))
+                    )
+                    position -= sell_size
+                if sell_size < bid_vol:
+                    best_remaining_bid = bid_price
+                    break
+            else:
+                best_remaining_bid = bid_price
+                break
+        else:
+            best_remaining_bid = None
 
-        # --- STEP 2: Penny-jump market-making with position skew ---
-        best_bid = (
-            max(order_depth.buy_orders.keys())
-            if order_depth.buy_orders
-            else fair - 8
+        return orders, position, best_remaining_bid, best_remaining_ask
+
+    def market_make(
+        self,
+        product: str,
+        fair_price: float,
+        position: int,
+        best_remaining_bid: int,
+        best_remaining_ask: int,
+        limit: int,
+        base_spread: float,
+        skew_intensity: float,
+    ) -> List[Order]:
+        """
+        Phase 2: Post market-making quotes anchored to reconciled book.
+
+        Uses penny-jumping (best_remaining_bid+1 / best_remaining_ask-1)
+        constrained by ideal spread from fair value. Position-proportional
+        skewing shifts both bid and ask to flatten inventory.
+        """
+        orders: List[Order] = []
+        if limit == 0:
+            return orders
+
+        skew = skew_intensity * (position / limit)
+
+        ideal_bid = math.floor(fair_price - base_spread - skew)
+        ideal_ask = math.ceil(fair_price + base_spread - skew)
+
+        # Anchor to remaining book liquidity (penny-jump)
+        best_market_bid = (
+            best_remaining_bid
+            if best_remaining_bid is not None
+            else ideal_bid
         )
-        best_ask = (
-            min(order_depth.sell_orders.keys())
-            if order_depth.sell_orders
-            else fair + 8
+        best_market_ask = (
+            best_remaining_ask
+            if best_remaining_ask is not None
+            else ideal_ask
         )
 
-        # Position-based offset: tighter when flat, wider when skewed
-        # position_ratio: -1 (max short) to +1 (max long)
-        pos_ratio = position / limit if limit > 0 else 0.0
+        optimal_bid = min(ideal_bid, best_market_bid + 1)
+        optimal_ask = max(ideal_ask, best_market_ask - 1)
 
-        # Base: penny-jump (1 tick inside best bid/ask)
-        # Skew: when long, buy less aggressively and sell more aggressively
-        buy_price = best_bid + 1
-        sell_price = best_ask - 1
+        buy_size = limit - position
+        sell_size = limit + position
 
-        # Position skewing: shift prices to flatten inventory
-        if pos_ratio > 0.4:
-            # Heavily long: widen buy, tighten sell toward fair
-            buy_price = min(buy_price, fair - 2)
-            sell_price = min(sell_price, fair + 1)
-        elif pos_ratio > 0.2:
-            buy_price = min(buy_price, fair - 1)
-            sell_price = min(sell_price, fair + 1)
-        elif pos_ratio < -0.4:
-            # Heavily short: tighten buy toward fair, widen sell
-            buy_price = max(buy_price, fair - 1)
-            sell_price = max(sell_price, fair + 2)
-        elif pos_ratio < -0.2:
-            sell_price = max(sell_price, fair + 1)
-            buy_price = max(buy_price, fair - 1)
-
-        # Clamp: never buy above fair or sell below fair
-        buy_price = min(buy_price, fair - 1)
-        sell_price = max(sell_price, fair + 1)
-
-        if remaining_buy > 0:
-            orders.append(Order(product, buy_price, remaining_buy))
-
-        if remaining_sell > 0:
-            orders.append(Order(product, sell_price, -remaining_sell))
+        if buy_size > 0:
+            orders.append(Order(product, int(optimal_bid), int(buy_size)))
+        if sell_size > 0:
+            orders.append(Order(product, int(optimal_ask), -int(sell_size)))
 
         return orders
 
-    def trade_tomatoes(
-        self, state: TradingState, product: str, trader_state: dict
-    ) -> tuple:
-        """
-        TOMATOES: EMA(58)-based mean-reversion with tight market-making.
+    def run(self, state: TradingState):
+        result: Dict[str, List[Order]] = {}
 
-        Strong negative autocorrelation (-0.41) means prices revert to EMA.
-        We aggressively take mispriced orders and post tight penny-jump
-        quotes around the EMA fair value to maximize passive fill rate.
-        """
-        orders: List[Order] = []
-        order_depth = state.order_depths[product]
-        position = state.position.get(product, 0)
-        limit = self.POSITION_LIMITS[product]
+        # Deserialize trader data
+        trader_data = {}
+        if state.traderData and state.traderData != "":
+            try:
+                trader_data = json.loads(state.traderData)
+            except (json.JSONDecodeError, TypeError):
+                trader_data = {}
 
-        best_bid = (
-            max(order_depth.buy_orders.keys())
-            if order_depth.buy_orders
-            else None
-        )
-        best_ask = (
-            min(order_depth.sell_orders.keys())
-            if order_depth.sell_orders
-            else None
-        )
+        if "history" not in trader_data:
+            trader_data["history"] = {"TOMATOES": []}
 
-        if best_bid is None or best_ask is None:
-            return orders, trader_state
+        for product in state.order_depths:
+            order_depth = state.order_depths[product]
+            position = state.position.get(product, 0)
+            limit = self.POSITION_LIMITS.get(product, 20)
 
-        mid_price = (best_bid + best_ask) / 2.0
-
-        # Update EMA fair value
-        ema_key = "tomatoes_ema"
-        if ema_key in trader_state:
-            prev_ema = trader_state[ema_key]
-            fair_value = (
-                self.TOMATOES_EMA_ALPHA * mid_price
-                + (1 - self.TOMATOES_EMA_ALPHA) * prev_ema
-            )
-        else:
-            fair_value = mid_price
-
-        trader_state[ema_key] = fair_value
-        fair_int = round(fair_value)
-
-        buy_capacity = limit - position
-        sell_capacity = limit + position
-
-        # --- STEP 1: Aggressively sweep mispriced orders ---
-        remaining_buy = buy_capacity
-        if remaining_buy > 0:
-            for ask_price, ask_vol in sorted(order_depth.sell_orders.items()):
-                if remaining_buy <= 0:
-                    break
-                if ask_price < fair_value:
-                    take_qty = min(-ask_vol, remaining_buy)
-                    orders.append(Order(product, ask_price, take_qty))
-                    remaining_buy -= take_qty
-                elif ask_price <= fair_int and position <= 0:
-                    take_qty = min(-ask_vol, remaining_buy)
-                    orders.append(Order(product, ask_price, take_qty))
-                    remaining_buy -= take_qty
-
-        remaining_sell = sell_capacity
-        if remaining_sell > 0:
-            for bid_price, bid_vol in sorted(
+            sorted_sells = sorted(order_depth.sell_orders.items())
+            sorted_buys = sorted(
                 order_depth.buy_orders.items(), reverse=True
-            ):
-                if remaining_sell <= 0:
-                    break
-                if bid_price > fair_value:
-                    take_qty = min(bid_vol, remaining_sell)
-                    orders.append(Order(product, bid_price, -take_qty))
-                    remaining_sell -= take_qty
-                elif bid_price >= fair_int and position >= 0:
-                    take_qty = min(bid_vol, remaining_sell)
-                    orders.append(Order(product, bid_price, -take_qty))
-                    remaining_sell -= take_qty
+            )
 
-        # --- STEP 2: Tight market-making with position skew ---
-        pos_ratio = position / limit if limit > 0 else 0.0
+            if not sorted_buys or not sorted_sells:
+                result[product] = []
+                continue
 
-        # Penny-jump: post 1 tick inside current best bid/ask
-        buy_price = best_bid + 1
-        sell_price = best_ask - 1
+            current_mid = (sorted_buys[0][0] + sorted_sells[0][0]) / 2.0
 
-        # Position-aware skewing
-        if pos_ratio > 0.4:
-            # Heavily long: widen buy, tighten sell
-            buy_price = min(buy_price, fair_int - 2)
-            sell_price = min(sell_price, fair_int + 1)
-        elif pos_ratio > 0.2:
-            buy_price = min(buy_price, fair_int - 1)
-            sell_price = min(sell_price, fair_int + 1)
-        elif pos_ratio < -0.4:
-            # Heavily short: tighten buy, widen sell
-            buy_price = max(buy_price, fair_int - 1)
-            sell_price = max(sell_price, fair_int + 2)
-        elif pos_ratio < -0.2:
-            buy_price = max(buy_price, fair_int - 1)
-            sell_price = max(sell_price, fair_int + 1)
+            if product == "EMERALDS":
+                fair_price = 10000.0
+                take_edge = 1.0
+                base_spread = 2.0
+                skew_intensity = 3.0
+            elif product == "TOMATOES":
+                hist = trader_data["history"].get("TOMATOES", [])
+                hist.append(current_mid)
+                if len(hist) > self.REGRESSION_WINDOW:
+                    hist.pop(0)
+                trader_data["history"]["TOMATOES"] = hist
+                fair_price = self.compute_regression_forecast(hist)
+                take_edge = 1.0
+                base_spread = 1.5
+                skew_intensity = 2.0
+            else:
+                fair_price = current_mid
+                take_edge = 1.0
+                base_spread = 2.0
+                skew_intensity = 2.0
 
-        # Clamp: never buy above fair or sell below fair
-        buy_price = min(buy_price, fair_int - 1)
-        sell_price = max(sell_price, fair_int + 1)
+            # Phase 1: Take mispriced orders
+            take_orders, updated_pos, rem_bid, rem_ask = (
+                self.take_opportunities(
+                    product,
+                    fair_price,
+                    position,
+                    sorted_buys,
+                    sorted_sells,
+                    limit,
+                    take_edge,
+                )
+            )
 
-        if remaining_buy > 0:
-            orders.append(Order(product, buy_price, remaining_buy))
+            # Phase 2: Market-make with reconciled book
+            make_orders = self.market_make(
+                product,
+                fair_price,
+                updated_pos,
+                rem_bid,
+                rem_ask,
+                limit,
+                base_spread,
+                skew_intensity,
+            )
 
-        if remaining_sell > 0:
-            orders.append(Order(product, sell_price, -remaining_sell))
+            result[product] = take_orders + make_orders
 
-        return orders, trader_state
+        trader_data_str = json.dumps(trader_data)
+        return result, 0, trader_data_str
