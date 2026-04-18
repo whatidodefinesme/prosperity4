@@ -143,20 +143,24 @@ logger = Logger()
 # Strategy:
 #
 #   ASH_COATED_OSMIUM (Round 2)
-#     - Pinned at fair = 10000 on every day observed (std ~5, spread ~16).
-#     - Lag-1 autocorrelation of Δmid ≈ -0.50 → strong bid-ask bounce.
-#     - Behaviour is essentially identical to EMERALDS / AMETHYSTS from prior
-#       rounds. Fixed fair + penny-jump market-making + take mispriced book
-#       levels is the right approach.
+#     - Empirically mean-reverts around ~10000 with std ~5 and spread ~16, but
+#       the first live submission showed the mid can drift 8-13 ticks off the
+#       10000 anchor for long stretches — with a hard-coded fair that sticks
+#       us at the short limit.
+#     - Fix: compute fair from a short (5-tick) rolling regression forecast so
+#       the quote centre tracks local mid while still reverting with the
+#       market.
+#     - Additional tuning to unstick inventory (see below): tighter
+#       MAKE_SPREAD (1.5), higher SKEW_INTENSITY (7), and 3-level tranched
+#       passive quotes.
 #
 #   INTARIAN_PEPPER_ROOT (Round 2)
 #     - Deterministic +1000 / day drift (11000 → 12000 → 13000 → 14000 across
 #       the three observed days), std ~288 per day, spread ~13–15.
-#     - Lag-1 AC of Δmid ≈ -0.50 as well — tick-level mean-revert sits on top
-#       of the low-frequency ramp.
-#     - We therefore use a rolling linear-regression forecast of the mid as
-#       fair (captures both the trend and the bounce) and market-make around
-#       it. This mirrors the proven TOMATOES structure.
+#     - Lag-1 AC of Δmid ≈ -0.50 — tick-level mean-revert sits on top of the
+#       low-frequency ramp.
+#     - Rolling linear-regression forecast (window 15) as fair, same 3-level
+#       tranched market-making around it.
 #
 #   EMERALDS / TOMATOES (Round 0)
 #     - Kept for backwards compatibility with the local backtester's Round 0
@@ -165,8 +169,11 @@ logger = Logger()
 # For each product we run a two-phase loop:
 #   Phase 1 (take): cross the book whenever we can lock in ≥ `take_edge`
 #                   ticks of edge relative to our fair price.
-#   Phase 2 (make): post a penny-jumping bid/ask anchored to the reconciled
-#                   post-take book, but never worse than fair ± make_spread.
+#   Phase 2 (make): post 3 passive tranches each side, anchored to the
+#                   reconciled post-take book. The innermost tranche
+#                   penny-jumps when inventory is near-neutral but switches
+#                   to the skew-driven ideal price when heavily loaded, so
+#                   inventory-unwinding quotes aren't capped by penny-jump.
 # ---------------------------------------------------------------------------
 
 
@@ -183,11 +190,20 @@ class Trader:
     # Products with a hard-coded fair value.
     STABLE_FAIRS = {
         "EMERALDS": 10000.0,
-        "ASH_COATED_OSMIUM": 10000.0,
     }
 
     # Products whose fair is computed from a rolling mid-price history.
-    TREND_PRODUCTS = ("TOMATOES", "INTARIAN_PEPPER_ROOT")
+    TREND_PRODUCTS = ("TOMATOES", "INTARIAN_PEPPER_ROOT", "ASH_COATED_OSMIUM")
+
+    # Per-product regression window (default 15 if not listed).
+    REGRESSION_WINDOW = {
+        "TOMATOES": 10,
+        "INTARIAN_PEPPER_ROOT": 15,
+        # Short window: Osmium reverts fast, we just want to follow the
+        # local mid rather than fight it.
+        "ASH_COATED_OSMIUM": 5,
+    }
+    DEFAULT_REGRESSION_WINDOW = 15
 
     # Minimum edge vs fair to cross the book.
     TAKE_EDGE = {
@@ -201,7 +217,7 @@ class Trader:
     MAKE_SPREAD = {
         "EMERALDS": 2.5,
         "TOMATOES": 1.5,
-        "ASH_COATED_OSMIUM": 2.0,
+        "ASH_COATED_OSMIUM": 1.5,
         "INTARIAN_PEPPER_ROOT": 2.5,
     }
 
@@ -209,12 +225,23 @@ class Trader:
     SKEW_INTENSITY = {
         "EMERALDS": 3.0,
         "TOMATOES": 2.0,
-        "ASH_COATED_OSMIUM": 3.0,
+        "ASH_COATED_OSMIUM": 7.0,
         "INTARIAN_PEPPER_ROOT": 2.0,
     }
 
-    # Rolling window for the linear-regression forecast used on trend products.
-    REGRESSION_WINDOW = 15
+    # Number of passive tranches posted on each side per tick (per product).
+    # Tranching is most useful on Osmium where inventory got stuck at the
+    # limit; other products work well with a single tight quote.
+    TRANCHES = {
+        "ASH_COATED_OSMIUM": 3,
+    }
+    DEFAULT_TRANCHES = 1
+    # Each additional tranche sits this many ticks deeper than the one above.
+    TRANCHE_STEP = 1
+    # Above this |position / limit| ratio the innermost passive quote uses
+    # the skew-driven ideal price directly (ignoring the penny-jump cap) so
+    # inventory can actually be unwound.
+    STRESS_RATIO = 0.6
 
     # ------------------------------------------------------------------
     # Helpers
@@ -304,8 +331,21 @@ class Trader:
         return orders, position, best_remaining_bid, best_remaining_ask
 
     # ------------------------------------------------------------------
-    # Phase 2: passive penny-jumped market-making quotes
+    # Phase 2: passive tranched market-making quotes
     # ------------------------------------------------------------------
+    @staticmethod
+    def _split_size(total: int, tranches: int) -> list[int]:
+        """Split `total` units into `tranches` positive chunks; front-load the
+        remainder onto the innermost (closest-to-fair) tranche.
+        """
+        if total <= 0 or tranches <= 0:
+            return []
+        per = total // tranches
+        remainder = total - per * tranches
+        sizes = [per] * tranches
+        sizes[0] += remainder
+        return [s for s in sizes if s > 0]
+
     def _make(
         self,
         product: str,
@@ -332,16 +372,39 @@ class Trader:
 
         # Penny-jump: sit one tick inside the best remaining market quote,
         # but never worse than our ideal (protects edge).
-        optimal_bid = min(ideal_bid, market_bid + 1)
-        optimal_ask = max(ideal_ask, market_ask - 1)
+        #
+        # When inventory is stressed (|pos/limit| >= STRESS_RATIO) we skip the
+        # penny-jump cap on the *reducing* side, so the skew is free to drive
+        # the quote through the book and actually unwind inventory.
+        stress = abs(position) / limit if limit > 0 else 0.0
+        stressed_long = stress >= self.STRESS_RATIO and position > 0  # need to sell
+        stressed_short = stress >= self.STRESS_RATIO and position < 0  # need to buy
 
-        buy_size = limit - position
-        sell_size = limit + position
+        if stressed_short:
+            optimal_bid = ideal_bid
+        else:
+            optimal_bid = min(ideal_bid, market_bid + 1)
 
-        if buy_size > 0:
-            orders.append(Order(product, int(optimal_bid), int(buy_size)))
-        if sell_size > 0:
-            orders.append(Order(product, int(optimal_ask), -int(sell_size)))
+        if stressed_long:
+            optimal_ask = ideal_ask
+        else:
+            optimal_ask = max(ideal_ask, market_ask - 1)
+
+        buy_capacity = limit - position
+        sell_capacity = limit + position
+
+        tranches = self.TRANCHES.get(product, self.DEFAULT_TRANCHES)
+
+        # Tranched passive quotes: progressively deeper layers.
+        buy_sizes = self._split_size(buy_capacity, tranches)
+        for i, size in enumerate(buy_sizes):
+            price = optimal_bid - i * self.TRANCHE_STEP
+            orders.append(Order(product, int(price), int(size)))
+
+        sell_sizes = self._split_size(sell_capacity, tranches)
+        for i, size in enumerate(sell_sizes):
+            price = optimal_ask + i * self.TRANCHE_STEP
+            orders.append(Order(product, int(price), -int(size)))
 
         return orders
 
@@ -374,9 +437,10 @@ class Trader:
             if product in self.STABLE_FAIRS:
                 fair_price = self.STABLE_FAIRS[product]
             elif product in self.TREND_PRODUCTS:
+                window = self.REGRESSION_WINDOW.get(product, self.DEFAULT_REGRESSION_WINDOW)
                 hist = history.get(product, [])
                 hist.append(current_mid)
-                if len(hist) > self.REGRESSION_WINDOW:
+                if len(hist) > window:
                     hist.pop(0)
                 history[product] = hist
                 fair_price = self._regression_forecast(hist)
