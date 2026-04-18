@@ -1,8 +1,9 @@
+from datamodel import OrderDepth, TradingState, Order
 import json
-import math
 from typing import Any
-
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
+
+
 
 
 class Logger:
@@ -137,344 +138,305 @@ class Logger:
 logger = Logger()
 
 
-# ---------------------------------------------------------------------------
-# Trader
-# ---------------------------------------------------------------------------
-# Strategy:
-#
-#   ASH_COATED_OSMIUM (Round 2)
-#     - Empirically mean-reverts around ~10000 with std ~5 and spread ~16, but
-#       the first live submission showed the mid can drift 8-13 ticks off the
-#       10000 anchor for long stretches — with a hard-coded fair that sticks
-#       us at the short limit.
-#     - Fix: compute fair from a short (5-tick) rolling regression forecast so
-#       the quote centre tracks local mid while still reverting with the
-#       market.
-#     - Additional tuning to unstick inventory (see below): tighter
-#       MAKE_SPREAD (1.5), higher SKEW_INTENSITY (7), and 3-level tranched
-#       passive quotes.
-#
-#   INTARIAN_PEPPER_ROOT (Round 2)
-#     - Deterministic +1000 / day drift (11000 → 12000 → 13000 → 14000 across
-#       the three observed days), std ~288 per day, spread ~13–15.
-#     - Lag-1 AC of Δmid ≈ -0.50 — tick-level mean-revert sits on top of the
-#       low-frequency ramp.
-#     - Rolling linear-regression forecast (window 15) as fair, same 3-level
-#       tranched market-making around it.
-#
-#   EMERALDS / TOMATOES (Round 0)
-#     - Kept for backwards compatibility with the local backtester's Round 0
-#       CSVs; same config that previously produced the best PnL.
-#
-# For each product we run a two-phase loop:
-#   Phase 1 (take): cross the book whenever we can lock in ≥ `take_edge`
-#                   ticks of edge relative to our fair price.
-#   Phase 2 (make): post 3 passive tranches each side, anchored to the
-#                   reconciled post-take book. The innermost tranche
-#                   penny-jumps when inventory is near-neutral but switches
-#                   to the skew-driven ideal price when heavily loaded, so
-#                   inventory-unwinding quotes aren't capped by penny-jump.
-# ---------------------------------------------------------------------------
 
+####
+####### SYMBOLS & LIMITS #######
+PEPPER_ROOT = 'INTARIAN_PEPPER_ROOT'   # steady / fixed-fair-value
+OSMIUM = 'ASH_COATED_OSMIUM'           # volatile with hidden pattern
 
-class Trader:
-    POSITION_LIMITS = {
-        # Round 0 products kept for backtester compatibility.
-        "EMERALDS": 80,
-        "TOMATOES": 80,
-        # Round 2 products.
-        "ASH_COATED_OSMIUM": 50,
-        "INTARIAN_PEPPER_ROOT": 50,
-    }
+POS_LIMITS = {
+    PEPPER_ROOT: 80,
+    OSMIUM: 80,
+}
 
-    # Products with a hard-coded fair value.
-    STABLE_FAIRS = {
-        "EMERALDS": 10000.0,
-    }
+# Parameters
+MR_WINDOW = 25          # EMA window for Osmium
+MR_TAKE_THRESHOLD = 1.0 # how far from EMA fair value we aggressively take liquidity
 
-    # Products whose fair is computed from a rolling mid-price history.
-    TREND_PRODUCTS = ("TOMATOES", "INTARIAN_PEPPER_ROOT", "ASH_COATED_OSMIUM")
+LONG, NEUTRAL, SHORT = 1, 0, -1
 
-    # Per-product regression window (default 15 if not listed).
-    REGRESSION_WINDOW = {
-        "TOMATOES": 10,
-        "INTARIAN_PEPPER_ROOT": 15,
-        # Short window: Osmium reverts fast, we just want to follow the
-        # local mid rather than fight it.
-        "ASH_COATED_OSMIUM": 5,
-    }
-    DEFAULT_REGRESSION_WINDOW = 15
+class ProductTrader:
+    def __init__(self, name, state, prints, new_trader_data, product_group=None):
+        self.orders = []
+        self.name = name
+        self.state = state
+        self.prints = prints
+        self.new_trader_data = new_trader_data
+        self.product_group = name if product_group is None else product_group
+        self.last_traderData = self.get_last_traderData()
+        self.position_limit = POS_LIMITS.get(self.name, 0)
+        self.initial_position = self.state.position.get(self.name, 0)
+        self.expected_position = self.initial_position
+        self.mkt_buy_orders, self.mkt_sell_orders = self.get_order_depth()
+        self.bid_wall, self.wall_mid, self.ask_wall = self.get_walls()
+        self.best_bid, self.best_ask = self.get_best_bid_ask()
+        self.max_allowed_buy_volume, self.max_allowed_sell_volume = self.get_max_allowed_volume()
+        self.total_mkt_buy_volume, self.total_mkt_sell_volume = self.get_total_market_buy_sell_volume()
+        self.imbalance = self.get_imbalance()
 
-    # Minimum edge vs fair to cross the book.
-    TAKE_EDGE = {
-        "EMERALDS": 1.0,
-        "TOMATOES": 1.5,
-        "ASH_COATED_OSMIUM": 1.0,
-        "INTARIAN_PEPPER_ROOT": 2.0,
-    }
+    def get_imbalance(self):
+        try:
+            total_vol = self.total_mkt_buy_volume + self.total_mkt_sell_volume
+            if total_vol == 0: return 0
+            return (self.total_mkt_buy_volume - self.total_mkt_sell_volume) / total_vol
+        except: pass
+        return 0
 
-    # Target half-spread around fair for passive market-making quotes.
-    MAKE_SPREAD = {
-        "EMERALDS": 2.5,
-        "TOMATOES": 1.5,
-        "ASH_COATED_OSMIUM": 1.5,
-        "INTARIAN_PEPPER_ROOT": 2.5,
-    }
+    def get_last_traderData(self):
+        last_traderData = {}
+        try:
+            if self.state.traderData != '':
+                last_traderData = json.loads(self.state.traderData)
+        except: pass
+        return last_traderData
 
-    # Inventory skew (how many ticks we shift both quotes when fully long/short).
-    SKEW_INTENSITY = {
-        "EMERALDS": 3.0,
-        "TOMATOES": 2.0,
-        "ASH_COATED_OSMIUM": 7.0,
-        "INTARIAN_PEPPER_ROOT": 2.0,
-    }
+    def get_best_bid_ask(self):
+        best_bid = best_ask = None
+        try:
+            if len(self.mkt_buy_orders) > 0: best_bid = max(self.mkt_buy_orders.keys())
+            if len(self.mkt_sell_orders) > 0: best_ask = min(self.mkt_sell_orders.keys())
+        except: pass
+        return best_bid, best_ask
 
-    # Target net inventory (the position around which skew is centred).
-    # Non-zero bias lets us lean persistently long/short on products with
-    # directional drift. Pepper Root trends up ~1 unit/tick across the day,
-    # so we bake in a long bias that keeps us loaded in the direction of drift.
-    POSITION_BIAS = {
-        "INTARIAN_PEPPER_ROOT": 20,
-    }
+    def get_walls(self):
+        bid_wall = wall_mid = ask_wall = None
+        try: bid_wall = min([x for x,_ in self.mkt_buy_orders.items()])
+        except: pass
+        try: ask_wall = max([x for x,_ in self.mkt_sell_orders.items()])
+        except: pass
+        try: wall_mid = (bid_wall + ask_wall) / 2
+        except: pass
+        return bid_wall, wall_mid, ask_wall
 
-    # Number of passive tranches posted on each side per tick (per product).
-    # Tranching is most useful on Osmium where inventory got stuck at the
-    # limit; other products work well with a single tight quote.
-    TRANCHES = {
-        "ASH_COATED_OSMIUM": 3,
-    }
-    DEFAULT_TRANCHES = 1
-    # Each additional tranche sits this many ticks deeper than the one above.
-    TRANCHE_STEP = 1
-    # Above this |position / limit| ratio the innermost passive quote uses
-    # the skew-driven ideal price directly (ignoring the penny-jump cap) so
-    # inventory can actually be unwound.
-    STRESS_RATIO = 0.6
+    def get_total_market_buy_sell_volume(self):
+        market_bid_volume = market_ask_volume = 0
+        try:
+            market_bid_volume = sum([v for p, v in self.mkt_buy_orders.items()])
+            market_ask_volume = sum([v for p, v in self.mkt_sell_orders.items()])
+        except: pass
+        return market_bid_volume, market_ask_volume
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    def get_max_allowed_volume(self):
+        return self.position_limit - self.initial_position, self.position_limit + self.initial_position
 
-    @staticmethod
-    def _mid(sorted_buys: list[tuple[int, int]], sorted_sells: list[tuple[int, int]]) -> float | None:
-        if not sorted_buys or not sorted_sells:
+    def get_order_depth(self):
+        buy_orders = sell_orders = {}
+        try:
+            order_depth: OrderDepth = self.state.order_depths[self.name]
+            buy_orders = {bp: abs(bv) for bp, bv in sorted(order_depth.buy_orders.items(), key=lambda x: x[0], reverse=True)}
+            sell_orders = {sp: abs(sv) for sp, sv in sorted(order_depth.sell_orders.items(), key=lambda x: x[0])}
+        except: pass
+        return buy_orders, sell_orders
+
+    def bid(self, price, volume, logging=True):
+        abs_volume = min(abs(int(volume)), self.max_allowed_buy_volume)
+        if abs_volume > 0:
+            self.orders.append(Order(self.name, int(price), abs_volume))
+            if logging: self.log("BUYO", {"p":price, "s":self.name, "v":int(volume)}, product_group='ORDERS')
+            self.max_allowed_buy_volume -= abs_volume
+
+    def ask(self, price, volume, logging=True):
+        abs_volume = min(abs(int(volume)), self.max_allowed_sell_volume)
+        if abs_volume > 0:
+            self.orders.append(Order(self.name, int(price), -abs_volume))
+            if logging: self.log("SELLO", {"p":price, "s":self.name, "v":int(volume)}, product_group='ORDERS')
+            self.max_allowed_sell_volume -= abs_volume
+
+    def log(self, kind, message, product_group=None):
+        if product_group is None: product_group = self.product_group
+        if product_group == 'ORDERS':
+            group = self.prints.get(product_group, [])
+            group.append({kind: message})
+        else:
+            group = self.prints.get(product_group, {})
+            group[kind] = message
+        self.prints[product_group] = group
+
+    def get_orders(self):
+        return {self.name: self.orders}
+
+# =============================================================================
+# TRENDING PRODUCT (PEPPER ROOT)
+# =============================================================================
+class TrendTrader(ProductTrader):
+    def __init__(self, state, prints, new_trader_data):
+        super().__init__(PEPPER_ROOT, state, prints, new_trader_data)
+        self.fair_value = self._calculate_fair_value()
+
+    def _calculate_fair_value(self):
+        current_mid = self.wall_mid
+        if current_mid is None:
             return None
-        return (sorted_buys[0][0] + sorted_sells[0][0]) / 2.0
 
-    @staticmethod
-    def _regression_forecast(history: list[float]) -> float:
-        """One-step-ahead forecast from a simple OLS line fit to `history`."""
-        n = len(history)
-        if n < 2:
-            return history[-1]
+        # Parametric ramp tracking
+        open_mid = self.last_traderData.get(f'open_mid_{self.name}', None)
+        if open_mid is None:
+            open_mid = current_mid
+        self.new_trader_data[f'open_mid_{self.name}'] = open_mid
 
-        sum_x = (n * (n - 1)) / 2.0
-        sum_x_sq = (n * (n - 1) * (2 * n - 1)) / 6.0
-        sum_y = sum(history)
-        sum_xy = sum(i * y for i, y in enumerate(history))
+        # Parametric fair based on known +1000 per 1M ms drift
+        parametric_fair = open_mid + (self.state.timestamp / 1_000_000) * 1000.0
 
-        mean_x = sum_x / n
-        mean_y = sum_y / n
-
-        denom = sum_x_sq - n * (mean_x ** 2)
-        if denom == 0:
-            return history[-1]
-
-        slope = (sum_xy - n * mean_x * mean_y) / denom
-        intercept = mean_y - slope * mean_x
-        return slope * n + intercept
-
-    # ------------------------------------------------------------------
-    # Phase 1: take mispriced orders in the book
-    # ------------------------------------------------------------------
-    def _take(
-        self,
-        product: str,
-        fair: float,
-        position: int,
-        sorted_buys: list[tuple[int, int]],
-        sorted_sells: list[tuple[int, int]],
-        limit: int,
-    ) -> tuple[list[Order], int, int | None, int | None]:
-        orders: list[Order] = []
-        edge = self.TAKE_EDGE.get(product, 1.0)
-
-        best_remaining_ask: int | None = sorted_sells[0][0] if sorted_sells else None
-        best_remaining_bid: int | None = sorted_buys[0][0] if sorted_buys else None
-
-        # Buy side: sweep asks priced at or below fair - edge.
-        for ask_price, ask_vol in sorted_sells:
-            if ask_price <= fair - edge:
-                available = abs(ask_vol)
-                size = min(available, limit - position)
-                if size > 0:
-                    orders.append(Order(product, int(ask_price), int(size)))
-                    position += size
-                if size < available:
-                    best_remaining_ask = ask_price
-                    break
-            else:
-                best_remaining_ask = ask_price
-                break
+        # Short-window EMA (alpha=0.08) for local noise
+        old_ema = self.last_traderData.get(f'ema_{self.name}', None)
+        alpha = 0.08
+        if old_ema is None:
+            new_ema = current_mid
         else:
-            best_remaining_ask = None
+            new_ema = alpha * current_mid + (1 - alpha) * old_ema
+        self.new_trader_data[f'ema_{self.name}'] = new_ema
+        ema_lag_comp = 0.1 * (1 - alpha) / alpha # ~1.15 compensation for lag
+        ema_fair = new_ema + ema_lag_comp
 
-        # Sell side: sweep bids priced at or above fair + edge.
-        for bid_price, bid_vol in sorted_buys:
-            if bid_price >= fair + edge:
-                available = bid_vol
-                size = min(available, limit + position)
-                if size > 0:
-                    orders.append(Order(product, int(bid_price), -int(size)))
-                    position -= size
-                if size < available:
-                    best_remaining_bid = bid_price
-                    break
-            else:
-                best_remaining_bid = bid_price
-                break
+        # Blend both for robust fair value
+        return (parametric_fair + ema_fair) / 2.0
+
+    def get_orders(self):
+        if self.best_bid is None or self.best_ask is None or self.fair_value is None:
+            return {self.name: self.orders}
+
+        # 1. INVENTORY SKEW
+        # Bias long strongly to aggressively accumulate the 80 position limit early
+        # on a parametrically drifting (trending) asset.
+        long_bias = 3.0 
+        inv_skew = (self.initial_position / self.position_limit) * 2.0
+        adj_fair = self.fair_value - inv_skew + long_bias
+
+        # 2. TAKING
+        for sp, sv in self.mkt_sell_orders.items():
+            # Aggressively take asks to ensure we hit max pos near the start
+            if sp <= adj_fair + 3.0: 
+                self.bid(sp, sv, logging=False)
+
+        for bp, bv in self.mkt_buy_orders.items():
+            if bp >= adj_fair + 1.5:
+                self.ask(bp, bv, logging=False)
+
+        # 3. MAKING
+        bid_price = int(self.best_bid + 1)
+        ask_price = int(self.best_ask - 1)
+        
+        if bid_price >= self.best_ask:
+            bid_price = self.best_bid
+        if ask_price <= self.best_bid:
+            ask_price = self.best_ask
+
+        my_bid = min(bid_price, int(adj_fair - 2.0))
+        my_ask = max(ask_price, int(adj_fair + 2.0))
+
+        if my_bid > 0:
+            self.bid(my_bid, self.max_allowed_buy_volume)
+        if my_ask > 0:
+            self.ask(my_ask, self.max_allowed_sell_volume)
+
+        return {self.name: self.orders}
+
+# =============================================================================
+# VOLATILE PRODUCT (OSMIUM)
+# =============================================================================
+class OsmiumTrader(ProductTrader):
+    def __init__(self, state, prints, new_trader_data):
+        super().__init__(OSMIUM, state, prints, new_trader_data)
+        self.fair_value = self._calculate_fair_value()
+
+    def _calculate_fair_value(self):
+        current_mid = self.wall_mid
+        if current_mid is None:
+            return 10000.0
+
+        old_ema = self.last_traderData.get(f'ema_{self.name}', None)
+        alpha = 2.0 / (MR_WINDOW + 1)
+        if old_ema is None:
+            new_ema = current_mid
         else:
-            best_remaining_bid = None
+            new_ema = alpha * current_mid + (1 - alpha) * old_ema
+            
+        self.new_trader_data[f'ema_{self.name}'] = new_ema
+        return new_ema
 
-        return orders, position, best_remaining_bid, best_remaining_ask
+    def get_orders(self):
+        if self.best_bid is None or self.best_ask is None or self.fair_value is None:
+            return {self.name: self.orders}
 
-    # ------------------------------------------------------------------
-    # Phase 2: passive tranched market-making quotes
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _split_size(total: int, tranches: int) -> list[int]:
-        """Split `total` units into `tranches` positive chunks; front-load the
-        remainder onto the innermost (closest-to-fair) tranche.
-        """
-        if total <= 0 or tranches <= 0:
-            return []
-        per = total // tranches
-        remainder = total - per * tranches
-        sizes = [per] * tranches
-        sizes[0] += remainder
-        return [s for s in sizes if s > 0]
+        # 1. INVENTORY SKEW
+        # Strong mean reversion -> reset around fair
+        inv_skew = (self.initial_position / self.position_limit) * 4.0
+        adj_fair = self.fair_value - inv_skew
 
-    def _make(
-        self,
-        product: str,
-        fair: float,
-        position: int,
-        best_remaining_bid: int | None,
-        best_remaining_ask: int | None,
-        limit: int,
-    ) -> list[Order]:
-        orders: list[Order] = []
-        if limit == 0:
-            return orders
+        # 2. TAKING
+        for sp, sv in self.mkt_sell_orders.items():
+            if sp <= adj_fair - 1.5:
+                self.bid(sp, sv, logging=False)
 
-        base_spread = self.MAKE_SPREAD.get(product, 2.0)
-        skew_intensity = self.SKEW_INTENSITY.get(product, 2.0)
-        bias = self.POSITION_BIAS.get(product, 0)
-        # Skew pushes both quotes *away* from the side we're loaded on relative
-        # to the target bias. A positive bias (e.g. Pepper Root) keeps us
-        # leaning long at all times.
-        skew = skew_intensity * ((position - bias) / limit)
+        for bp, bv in self.mkt_buy_orders.items():
+            if bp >= adj_fair + 1.5:
+                self.ask(bp, bv, logging=False)
 
-        ideal_bid = math.floor(fair - base_spread - skew)
-        ideal_ask = math.ceil(fair + base_spread - skew)
+        # 3. MAKING
+        # Penny jump best inside the spread
+        bid_price = int(self.best_bid + 1)
+        ask_price = int(self.best_ask - 1)
+        
+        if bid_price >= self.best_ask:
+            bid_price = self.best_bid
+        if ask_price <= self.best_bid:
+            ask_price = self.best_ask
 
-        market_bid = best_remaining_bid if best_remaining_bid is not None else ideal_bid
-        market_ask = best_remaining_ask if best_remaining_ask is not None else ideal_ask
+        # Hard cap quotes inside fair value constraint to avoid getting run over
+        my_bid = min(bid_price, int(adj_fair - 1.0))
+        my_ask = max(ask_price, int(adj_fair + 1.0))
 
-        # Penny-jump: sit one tick inside the best remaining market quote,
-        # but never worse than our ideal (protects edge).
-        #
-        # When inventory is stressed (|pos/limit| >= STRESS_RATIO) we skip the
-        # penny-jump cap on the *reducing* side, so the skew is free to drive
-        # the quote through the book and actually unwind inventory.
-        stress = abs(position) / limit if limit > 0 else 0.0
-        stressed_long = stress >= self.STRESS_RATIO and position > 0  # need to sell
-        stressed_short = stress >= self.STRESS_RATIO and position < 0  # need to buy
+        if my_bid > 0:
+            self.bid(my_bid, self.max_allowed_buy_volume)
+        if my_ask > 0:
+            self.ask(my_ask, self.max_allowed_sell_volume)
 
-        if stressed_short:
-            optimal_bid = ideal_bid
-        else:
-            optimal_bid = min(ideal_bid, market_bid + 1)
+        return {self.name: self.orders}
 
-        if stressed_long:
-            optimal_ask = ideal_ask
-        else:
-            optimal_ask = max(ideal_ask, market_ask - 1)
+# =============================================================================
+# MAIN TRADER
+# =============================================================================
+class Trader:
+    # Position limits — also referenced by our local backtester
+    POSITION_LIMITS = {
+        "EMERALDS": 20,
+        "TOMATOES": 20,
+        "INTARIAN_PEPPER_ROOT": 80,
+        "ASH_COATED_OSMIUM": 80,
+    }
 
-        buy_capacity = limit - position
-        sell_capacity = limit + position
+    def run(self, state: TradingState):
+        result: dict[str, list[Order]] = {}
+        conversions =0
+        new_trader_data = {}
+        prints = {
+            "GENERAL": {
+                "TIMESTAMP": state.timestamp,
+                "POSITIONS": state.position
+            },
+        }
 
-        tranches = self.TRANCHES.get(product, self.DEFAULT_TRANCHES)
+        product_traders = {
+            PEPPER_ROOT: TrendTrader,      
+            OSMIUM: OsmiumTrader,           
+        }
 
-        # Tranched passive quotes: progressively deeper layers.
-        buy_sizes = self._split_size(buy_capacity, tranches)
-        for i, size in enumerate(buy_sizes):
-            price = optimal_bid - i * self.TRANCHE_STEP
-            orders.append(Order(product, int(price), int(size)))
-
-        sell_sizes = self._split_size(sell_capacity, tranches)
-        for i, size in enumerate(sell_sizes):
-            price = optimal_ask + i * self.TRANCHE_STEP
-            orders.append(Order(product, int(price), -int(size)))
-
-        return orders
-
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
-    def run(self, state: TradingState) -> tuple[dict[Symbol, list[Order]], int, str]:
-        result: dict[Symbol, list[Order]] = {}
-        conversions = 0
+        for symbol, TraderClass in product_traders.items():
+            if symbol in state.order_depths:
+                try:
+                    trader = TraderClass(state, prints, new_trader_data)
+                    result.update(trader.get_orders())
+                except Exception as e:
+                    pass  # safety – never crash the bot
 
         try:
-            memory = json.loads(state.traderData) if state.traderData else {}
-        except (json.JSONDecodeError, TypeError):
-            memory = {}
-        history: dict[str, list[float]] = memory.get("history", {})
+            final_trader_data = json.dumps(new_trader_data)
+        except:
+            final_trader_data = ''
 
-        for product, order_depth in state.order_depths.items():
-            position = state.position.get(product, 0)
-            limit = self.POSITION_LIMITS.get(product, 20)
-
-            sorted_sells = sorted(order_depth.sell_orders.items())
-            sorted_buys = sorted(order_depth.buy_orders.items(), reverse=True)
-
-            current_mid = self._mid(sorted_buys, sorted_sells)
-            if current_mid is None:
-                # Empty book on one side — skip this tick for this product.
-                continue
-
-            # --- Fair-value estimation ---
-            if product in self.STABLE_FAIRS:
-                fair_price = self.STABLE_FAIRS[product]
-            elif product in self.TREND_PRODUCTS:
-                window = self.REGRESSION_WINDOW.get(product, self.DEFAULT_REGRESSION_WINDOW)
-                hist = history.get(product, [])
-                hist.append(current_mid)
-                if len(hist) > window:
-                    hist.pop(0)
-                history[product] = hist
-                fair_price = self._regression_forecast(hist)
-            else:
-                # Unknown product — fall back to mid; still safe to market-make.
-                fair_price = current_mid
-
-            # --- Phase 1: take ---
-            take_orders, position_after_take, best_rem_bid, best_rem_ask = self._take(
-                product, fair_price, position, sorted_buys, sorted_sells, limit
-            )
-
-            # --- Phase 2: make ---
-            make_orders = self._make(
-                product, fair_price, position_after_take, best_rem_bid, best_rem_ask, limit
-            )
-
-            orders = take_orders + make_orders
-            if orders:
-                result[product] = orders
-
-        memory["history"] = history
-        trader_data = json.dumps(memory, separators=(",", ":"))
-
-        logger.flush(state, result, conversions, trader_data)
-        return result, conversions, trader_data
+        # try:
+        #     print(json.dumps(prints))
+        # except:
+        #     pass
+        logger.flush(state, result, conversions, final_trader_data)
+        return result, conversions, final_trader_data
