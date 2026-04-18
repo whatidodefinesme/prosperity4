@@ -229,6 +229,14 @@ class Trader:
         "INTARIAN_PEPPER_ROOT": 2.0,
     }
 
+    # Target net inventory (the position around which skew is centred).
+    # Non-zero bias lets us lean persistently long/short on products with
+    # directional drift. Pepper Root trends up ~1 unit/tick across the day,
+    # so we bake in a long bias that keeps us loaded in the direction of drift.
+    POSITION_BIAS = {
+        "INTARIAN_PEPPER_ROOT": 20,
+    }
+
     # Number of passive tranches posted on each side per tick (per product).
     # Tranching is most useful on Osmium where inventory got stuck at the
     # limit; other products work well with a single tight quote.
@@ -361,8 +369,11 @@ class Trader:
 
         base_spread = self.MAKE_SPREAD.get(product, 2.0)
         skew_intensity = self.SKEW_INTENSITY.get(product, 2.0)
-        # Skew pushes both quotes *away* from the side we're already loaded on.
-        skew = skew_intensity * (position / limit)
+        bias = self.POSITION_BIAS.get(product, 0)
+        # Skew pushes both quotes *away* from the side we're loaded on relative
+        # to the target bias. A positive bias (e.g. Pepper Root) keeps us
+        # leaning long at all times.
+        skew = skew_intensity * ((position - bias) / limit)
 
         ideal_bid = math.floor(fair - base_spread - skew)
         ideal_ask = math.ceil(fair + base_spread - skew)
