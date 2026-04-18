@@ -21,15 +21,15 @@ class Listing:
 class ConversionObservation:
 
     def __init__(self, bidPrice: float, askPrice: float, transportFees: float,
-                 exportTariff: float, importTariff: float, sunlight: float,
-                 humidity: float):
+                 exportTariff: float, importTariff: float, sugarPrice: float,
+                 sunlightIndex: float):
         self.bidPrice = bidPrice
         self.askPrice = askPrice
         self.transportFees = transportFees
         self.exportTariff = exportTariff
         self.importTariff = importTariff
-        self.sunlight = sunlight
-        self.humidity = humidity
+        self.sugarPrice = sugarPrice
+        self.sunlightIndex = sunlightIndex
 
 
 class Observation:

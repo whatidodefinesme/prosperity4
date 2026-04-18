@@ -389,3 +389,18 @@ if __name__ == "__main__":
     print(f"COMBINED PnL (Day -1 + Day -2): {pnl_d1 + pnl_d2:.2f}")
     print(f"Average PnL per day: {(pnl_d1 + pnl_d2) / 2:.2f}")
     print(f"{'#'*60}")
+
+    # Round 2 backtests
+    round2_pnl = []
+    for day in (-1, 0, 1):
+        prices_path = os.path.join(base_dir, f"prices_round_2_day_{day}.csv")
+        trades_path = os.path.join(base_dir, f"trades_round_2_day_{day}.csv")
+        if os.path.exists(prices_path) and os.path.exists(trades_path):
+            round2_pnl.append(run_backtest(prices_path, trades_path, label=f"Round 2 Day {day}"))
+
+    if round2_pnl:
+        total = sum(round2_pnl)
+        print(f"\n{'#'*60}")
+        print(f"ROUND 2 COMBINED PnL ({len(round2_pnl)} days): {total:.2f}")
+        print(f"Round 2 average PnL per day: {total / len(round2_pnl):.2f}")
+        print(f"{'#'*60}")
